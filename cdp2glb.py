@@ -7,6 +7,8 @@ cdp2glb.py - convert Trainz .cdp (ACS$ / CHUMP) packages to glTF binary (.glb) f
     python cdp2glb.py "BN SW1200.cdp" out_folder --extract      (also dump every file in the package)
     python cdp2glb.py "BN SW1200.cdp" out_folder --all-lods     (export every LOD mesh, not just the best)
     python cdp2glb.py "BN SW1200.cdp" out_folder --asset sw1200 (only assets whose name/kuid contains this text)
+    python cdp2glb.py "BN SW1200.cdp" out_folder --no-anim      (skip .kin animations)
+    python cdp2glb.py bell.kin out_folder                       (a loose .kin -> bones + animation .glb)
 
 Then in Blender: File > Import > glTF 2.0 (.glb/.gltf).
 
@@ -17,15 +19,38 @@ Pure Python 3, no third-party packages.  The container + compression format
 (LZSS / adaptive-Huffman) follows the community reverse-engineering in `cdptool`
 and CDP Explorer; the .im mesh reader was worked out from your sample files.
 
+Animations: every .kin (JIRF/ANIM) in an asset becomes a glTF animation on a small bone hierarchy
+(empties named after the bones).  Meshes whose name / mesh-table entry points at a .kin are parented
+to the matching bone, so they move in Blender.  Skinned meshes (vertex weights) are not supported.
+
 Trainz models are Z-up / Y-forward (same as Blender); the glb is rotated to glTF's
 Y-up convention so Blender's importer puts them back upright.
 """
 import sys, os, re, json, struct, zlib, argparse, time
 
-# Windows consoles (cp1252) crash on odd characters in asset names -> never let print() kill the run
+VERSION = "2.0"
+
+# Windows consoles (cp1252) crash on odd characters in asset names -> never let print() kill the run.
+# line_buffering: progress shows up immediately even when output is redirected to a file.
 for _s in (sys.stdout, sys.stderr):
     try:
-        _s.reconfigure(errors="replace")
+        _s.reconfigure(errors="replace", line_buffering=True)
+    except Exception:
+        pass
+
+
+def _disable_quickedit():
+    """Windows console 'QuickEdit': a stray click in the window freezes the program until Enter is pressed.
+    Switch it off for this console (no effect elsewhere)."""
+    if os.name != "nt":
+        return
+    try:
+        import ctypes
+        k32 = ctypes.windll.kernel32
+        h = k32.GetStdHandle(-10)                       # STD_INPUT_HANDLE
+        mode = ctypes.c_uint32()
+        if k32.GetConsoleMode(h, ctypes.byref(mode)):
+            k32.SetConsoleMode(h, (mode.value & ~0x0040) | 0x0080)   # clear QUICK_EDIT, set EXTENDED_FLAGS
     except Exception:
         pass
 
@@ -367,8 +392,10 @@ class Node:
         self.name, self.type, self.off, self.end, self.kids = name, type_, off, end, []
 
 
-def parse_tree(data, off, end):
+def parse_tree(data, off, end, depth=0):
     nodes = []
+    if depth > 40:
+        return nodes
     while off + 6 <= end:
         tag_len = struct.unpack_from("<I", data, off)[0]
         start = off
@@ -391,10 +418,15 @@ def parse_tree(data, off, end):
             break
         n = Node(name, ttype, off, vend)
         if ttype == 0:
-            n.kids = parse_tree(data, off, vend)
+            n.kids = parse_tree(data, off, vend, depth + 1)
         nodes.append(n)
         off = vend
     return nodes
+
+
+def _base(fname):
+    """'Textures\\Main.TGA' -> 'main.tga'"""
+    return fname.replace("\\", "/").split("/")[-1].strip().lower()
 
 
 class Asset:
@@ -406,13 +438,16 @@ class Asset:
         self.cache = {}
 
     def has(self, fname):
-        return fname.lower() in self.files
+        return _base(fname) in self.files
 
 
 class Package:
     def __init__(self, data):
         if bytes(data[:4]) != b"ACS$":
-            raise SystemExit("Not a Trainz ACS$ package.")
+            raise SystemExit("Not a Trainz ACS$ package (header is %r). Is it a .cdp from Trainz? "
+                             "Other containers (zip / encrypted) are not supported." % bytes(data[:4]))
+        if len(data) < 32:
+            raise SystemExit("File is too small to be a .cdp.")
         self.data = data
         self.assets = []
         tree = parse_tree(data, 16, len(data))
@@ -444,9 +479,11 @@ class Package:
                     self._walk(n.kids)
 
     def read(self, asset, fname):
-        key = fname.lower()
+        key = _base(fname)
         if key in asset.cache:
             return asset.cache[key]
+        if key not in asset.files:
+            raise KeyError("file %r not in asset %s" % (fname, asset.name))
         n = asset.files[key]
         us = struct.unpack_from("<I", self.data, n.off)[0]
         out = decompress(bytes(self.data[n.off + 4:n.end]), us)
@@ -456,7 +493,7 @@ class Package:
 
     def find(self, asset, fname):
         """look in the asset first, then any other asset (dependencies). Returns (asset, name) or None"""
-        k = fname.lower()
+        k = _base(fname)
         if k in asset.files:
             return asset, k
         return self._global.get(k)
@@ -580,12 +617,75 @@ def decode_bmp(b):
     return w, h, rgba
 
 
+def _rgb565(v):
+    return (((v >> 11) & 31) * 255 // 31, ((v >> 5) & 63) * 255 // 63, (v & 31) * 255 // 31)
+
+
+def decode_dds(b):
+    if b[:4] != b"DDS ":
+        raise ValueError("not a DDS")
+    h, w = struct.unpack_from("<II", b, 12)
+    flags = struct.unpack_from("<I", b, 80)[0]
+    cc = bytes(b[84:88])
+    bpp = struct.unpack_from("<I", b, 88)[0]
+    masks = struct.unpack_from("<4I", b, 92)
+    pos = 128
+    if cc == b"DX10":
+        raise ValueError("DX10 DDS unsupported")
+    rgba = bytearray(w * h * 4)
+    if cc in (b"DXT1", b"DXT3", b"DXT5"):
+        bw, bh = (w + 3) // 4, (h + 3) // 4
+        bs = 8 if cc == b"DXT1" else 16
+        for by in range(bh):
+            for bx in range(bw):
+                blk = b[pos:pos + bs]
+                pos += bs
+                if len(blk) < bs:
+                    break
+                cb = blk[bs - 8:]
+                c0, c1, bits = struct.unpack_from("<HHI", cb, 0)
+                p0, p1 = _rgb565(c0), _rgb565(c1)
+                if c0 > c1 or cc != b"DXT1":
+                    pal = [p0 + (255,), p1 + (255,),
+                           tuple((2 * p0[i] + p1[i]) // 3 for i in range(3)) + (255,),
+                           tuple((p0[i] + 2 * p1[i]) // 3 for i in range(3)) + (255,)]
+                else:
+                    pal = [p0 + (255,), p1 + (255,), tuple((p0[i] + p1[i]) // 2 for i in range(3)) + (255,), (0, 0, 0, 0)]
+                al = None
+                if cc == b"DXT3":
+                    al = [((struct.unpack_from("<Q", blk, 0)[0] >> (4 * i)) & 15) * 17 for i in range(16)]
+                elif cc == b"DXT5":
+                    a0, a1 = blk[0], blk[1]
+                    t = [a0, a1] + ([(( 6 - i) * a0 + (1 + i) * a1) // 7 for i in range(6)] if a0 > a1
+                                    else [((4 - i) * a0 + (1 + i) * a1) // 5 for i in range(4)] + [0, 255])
+                    ab = int.from_bytes(blk[2:8], "little")
+                    al = [t[(ab >> (3 * i)) & 7] for i in range(16)]
+                for i in range(16):
+                    x, y = bx * 4 + (i & 3), by * 4 + (i >> 2)
+                    if x < w and y < h:
+                        c = pal[(bits >> (2 * i)) & 3]
+                        o = (y * w + x) * 4
+                        rgba[o:o + 4] = bytes((c[0], c[1], c[2], al[i] if al else c[3]))
+        return w, h, rgba
+    if bpp in (24, 32) and masks[0]:
+        px = bpp // 8
+        sh = [(m & -m).bit_length() - 1 if m else None for m in masks]
+        for i in range(w * h):
+            v = int.from_bytes(b[pos + i * px:pos + (i + 1) * px], "little")
+            rgba[i * 4:i * 4 + 4] = bytes(((v >> sh[0]) & 255, (v >> sh[1]) & 255, (v >> sh[2]) & 255,
+                                            ((v >> sh[3]) & 255) if sh[3] is not None else 255))
+        return w, h, rgba
+    raise ValueError("unsupported DDS format")
+
+
 def decode_image(name, data):
     ext = name.rsplit(".", 1)[-1].lower()
     if ext == "tga":
         return decode_tga(data)
     if ext == "bmp":
         return decode_bmp(data)
+    if ext == "dds":
+        return decode_dds(data)
     return None
 
 
@@ -609,7 +709,7 @@ def read_im(b):
         if tag == b"CHNK":
             try:
                 pr = read_chnk(body)
-            except struct.error:
+            except Exception:
                 pr = None
             if pr:
                 prims.append(pr)
@@ -623,7 +723,7 @@ def read_im(b):
                     m = struct.unpack_from("<12f", body, q + 4 + n)
                     attach.append((name, m))
                     q += 4 + n + 48
-            except struct.error:
+            except Exception:
                 pass          # damaged attach table: keep the mesh anyway
         p += 8 + sz
     return prims, attach
@@ -882,6 +982,9 @@ class GLB:
         self.views, self.accs, self.meshes, self.nodes = [], [], [], []
         self.mats, self.images, self.textures, self.samplers = [], [], [], [{"magFilter": 9729, "minFilter": 9987, "wrapS": 10497, "wrapT": 10497}]
         self.matkey, self.imgkey, self.cfgkey = {}, {}, {}
+        self.attach, self.meshnode, self.bbox = {}, {}, {}
+        self.anims = []
+        self.kinmap = {}
 
     def _view(self, data, target=None):
         while len(self.bin) % 4:
@@ -914,7 +1017,8 @@ class GLB:
                "scene": 0, "scenes": [{"nodes": [i for i, n in enumerate(self.nodes) if not n.pop("_child", False)]}],
                "nodes": self.nodes, "buffers": [{"byteLength": len(self.bin)}]}
         for k, v in (("bufferViews", self.views), ("accessors", self.accs), ("meshes", self.meshes),
-                     ("materials", self.mats), ("images", self.images), ("textures", self.textures)):
+                     ("materials", self.mats), ("images", self.images), ("textures", self.textures),
+                     ("animations", self.anims)):
             if v:
                 doc[k] = v
         doc["samplers"] = self.samplers
@@ -1007,11 +1111,57 @@ def rot(x, y, z):
     return x, z, -y
 
 
+def _matmul(A, B):
+    return [[sum(A[i][k] * B[k][j] for k in range(3)) for j in range(3)] for i in range(3)]
+
+
+def mat_to_quat(R):
+    t = R[0][0] + R[1][1] + R[2][2]
+    if t > 0:
+        s = (t + 1) ** 0.5 * 2
+        return ((R[2][1] - R[1][2]) / s, (R[0][2] - R[2][0]) / s, (R[1][0] - R[0][1]) / s, s / 4)
+    if R[0][0] > R[1][1] and R[0][0] > R[2][2]:
+        s = (1 + R[0][0] - R[1][1] - R[2][2]) ** 0.5 * 2
+        return (s / 4, (R[0][1] + R[1][0]) / s, (R[0][2] + R[2][0]) / s, (R[2][1] - R[1][2]) / s)
+    if R[1][1] > R[2][2]:
+        s = (1 + R[1][1] - R[0][0] - R[2][2]) ** 0.5 * 2
+        return ((R[0][1] + R[1][0]) / s, s / 4, (R[1][2] + R[2][1]) / s, (R[0][2] - R[2][0]) / s)
+    s = (1 + R[2][2] - R[0][0] - R[1][1]) ** 0.5 * 2
+    return ((R[0][2] + R[2][0]) / s, (R[1][2] + R[2][1]) / s, s / 4, (R[1][0] - R[0][1]) / s)
+
+
+def attach_quat(m, transpose=False):
+    """attach matrix (3x3 rows + translation) -> glTF quaternion, or None if identity / not a clean rotation.
+    Default: rows are the local axes (DirectX style).  --attach-transpose flips that."""
+    try:
+        R = [[m[j * 3 + i] if not transpose else m[i * 3 + j] for j in range(3)] for i in range(3)]
+        det = (R[0][0] * (R[1][1] * R[2][2] - R[1][2] * R[2][1]) - R[0][1] * (R[1][0] * R[2][2] - R[1][2] * R[2][0])
+               + R[0][2] * (R[1][0] * R[2][1] - R[1][1] * R[2][0]))
+        cols = [sum(R[i][j] ** 2 for i in range(3)) for j in range(3)]
+        if abs(det - 1) > 0.05 or any(abs(c - 1) > 0.05 for c in cols):
+            return None
+        C = [[1, 0, 0], [0, 0, 1], [0, -1, 0]]
+        Ct = [[C[j][i] for j in range(3)] for i in range(3)]
+        q = _qnorm(mat_to_quat(_matmul(_matmul(C, R), Ct)))
+        if abs(q[3]) > 0.99999:
+            return None
+        return q if q[3] >= 0 else tuple(-c for c in q)
+    except Exception:
+        return None
+
+
 def add_mesh(pkg, asset, glb, im_name, label, log):
+    hit = pkg.find(asset, im_name)
+    if not hit:
+        raise KeyError("mesh %s not found in package" % im_name)
+    asset, im_name = hit                      # may live in a dependency asset; its textures are looked up there first
     prims, attach = read_im(pkg.read(asset, im_name))
     gprims = []
     tri_counts = []
+    omn, omx = [1e30] * 3, [-1e30] * 3
     for pr in prims:
+        if not getattr(glb, "keep_all", False) and re.search(r"shadow|collision", pr.mat_name or "", re.I):
+            continue                       # game helper geometry (flat shadow blob etc.)
         nv, V, idx, N = pr.verts
         idx = [i for i in idx]
         idx = idx[:len(idx) // 3 * 3]
@@ -1049,6 +1199,9 @@ def add_mesh(pkg, asset, glb, im_name, label, log):
         if N:
             attrs["NORMAL"] = glb.acc(bytes(nor), 5126, nv, "VEC3", 34962)
         ind = glb.acc(struct.pack("<%dH" % len(idx), *idx), 5123, len(idx), "SCALAR", 34963)
+        for k_ in range(3):
+            omn[k_] = min(omn[k_], mn[k_])
+            omx[k_] = max(omx[k_], mx[k_])
         # material
         mk = (pr.mat_name, pr.textures.get(1), pr.textures.get(8))
         if mk not in glb.matkey:
@@ -1067,6 +1220,8 @@ def add_mesh(pkg, asset, glb, im_name, label, log):
                 r = build_texture(pkg, asset, glb, pr.textures[8], False, log)
                 if r:
                     m["normalTexture"] = {"index": r[0]}
+            if m.get("alphaMode") in ("MASK", "BLEND"):
+                m["doubleSided"] = True
             glb.mats.append(m)
             glb.matkey[mk] = len(glb.mats) - 1
         tri_counts.append(len(idx) // 3)
@@ -1079,11 +1234,509 @@ def add_mesh(pkg, asset, glb, im_name, label, log):
     glb.meshes.append({"name": label, "primitives": gprims})
     glb.nodes.append({"name": label, "mesh": len(glb.meshes) - 1})
     ni = len(glb.nodes) - 1
+    glb.meshnode[label] = ni
+    glb.bbox[label] = (omn, omx)
     for name, m in attach:
         t = m[9:12]
         if all(c == c and abs(c) < 1e8 for c in t):
-            glb.nodes.append({"name": "%s.%s" % (label, name), "translation": list(rot(*t))})
+            if not getattr(glb, "no_attach", False):
+                en = {"name": "%s.%s" % (label, name), "translation": list(rot(*t))}
+                q = attach_quat(m, getattr(glb, "attach_transpose", False))
+                if q:
+                    en["rotation"] = list(q)
+                glb.nodes.append(en)
+            glb.attach.setdefault(name.lower(), (tuple(t), label, tuple(m)))
     return ntris, len(gprims), len(attach)
+
+
+# =====================================================================
+#  Trainz .kin animation  (JIRF/ANIM: INFO, EVNT, SKEL(BONE tree), FRAM per frame)
+#  per bone per frame: position (3 floats) + quaternion x,y,z,w (4 floats), local to the parent bone
+# =====================================================================
+class Kin:
+    pass
+
+
+def read_kin(b):
+    b = bytes(b)
+    if b[:4] != b"JIRF" or b[8:12] != b"ANIM":
+        raise ValueError("not a Trainz .kin (no JIRF/ANIM header)")
+    total = min(struct.unpack_from("<I", b, 4)[0] + 8, len(b))
+    k = Kin()
+    k.src_name, k.nframes, k.fps = "", 0, 30
+    k.bones, k.frames = [], []              # bones: (name, parent index);  frames: [(pos, quat) per bone]
+
+    def bone(body, o, parent, depth=0):
+        if depth > 64:
+            raise ValueError("bone tree too deep")
+        nl = struct.unpack_from("<I", body, o + 4)[0]
+        o += 8
+        name = bytes(body[o:o + nl]).split(b"\0")[0].decode("latin1")
+        o += nl
+        nch = struct.unpack_from("<I", body, o)[0]
+        o += 4
+        k.bones.append((name, parent))
+        me = len(k.bones) - 1
+        for _ in range(nch):
+            if bytes(body[o:o + 4]) != b"BONE":
+                raise ValueError("expected BONE")
+            sz = struct.unpack_from("<I", body, o + 4)[0]
+            bone(body, o + 8, me, depth + 1)
+            o += 8 + sz
+
+    p = 12
+    while p + 8 <= total:
+        tag = bytes(b[p:p + 4])
+        sz = struct.unpack_from("<I", b, p + 4)[0]
+        body = b[p + 8:p + 8 + sz]
+        if tag == b"INFO":
+            nl = struct.unpack_from("<I", body, 4)[0]
+            k.src_name = bytes(body[8:8 + nl]).split(b"\0")[0].decode("latin1")
+            k.nframes, fps = struct.unpack_from("<II", body, 8 + nl)
+            k.fps = fps if 0 < fps <= 1000 else 30
+        elif tag == b"SKEL":
+            o = 4
+            while o + 8 <= len(body) and bytes(body[o:o + 4]) == b"BONE":
+                bone(body, o + 8, -1)
+                o += 8 + struct.unpack_from("<I", body, o + 4)[0]
+        elif tag == b"FRAM":
+            nb = len(k.bones)
+            if nb and len(body) >= 8 + nb * 28:
+                idx = struct.unpack_from("<I", body, 4)[0]
+                v = struct.unpack_from("<%df" % (nb * 7), body, 8)
+                k.frames.append((idx, [(v[i * 7:i * 7 + 3], v[i * 7 + 3:i * 7 + 7]) for i in range(nb)]))
+        p += 8 + sz
+    k.frames.sort(key=lambda f: f[0])
+    if not k.bones:
+        raise ValueError("kin has no skeleton")
+    return k
+
+
+def _qmul(a, b):
+    ax, ay, az, aw = a
+    bx, by, bz, bw = b
+    return (aw * bx + ax * bw + ay * bz - az * by, aw * by - ax * bz + ay * bw + az * bx,
+            aw * bz + ax * by - ay * bx + az * bw, aw * bw - ax * bx - ay * by - az * bz)
+
+
+def _qrot(q, v):
+    qx, qy, qz, qw = q
+    t = (2 * (qy * v[2] - qz * v[1]), 2 * (qz * v[0] - qx * v[2]), 2 * (qx * v[1] - qy * v[0]))
+    return (v[0] + qw * t[0] + qy * t[2] - qz * t[1], v[1] + qw * t[1] + qz * t[0] - qx * t[2],
+            v[2] + qw * t[2] + qx * t[1] - qy * t[0])
+
+
+def _qnorm(q):
+    l = sum(c * c for c in q) ** 0.5
+    if not l or l != l:
+        return (0.0, 0.0, 0.0, 1.0)
+    return tuple(c / l for c in q)
+
+
+def rotq(q):
+    """quaternion Z-up -> glTF Y-up (same axis change as rot(); it is a proper rotation so xyz just maps)"""
+    x, y, z = rot(q[0], q[1], q[2])
+    return (x, y, z, q[3])
+
+
+def add_rig(glb, kin, label, log):
+    """Bone hierarchy as empties + one glTF animation.  Returns (bone node indices, world rest positions in glTF space)."""
+    used = {n.get("name") for n in glb.nodes}
+    ids, rest_w = [], []
+    f0 = kin.frames[0][1] if kin.frames else [((0, 0, 0), (0, 0, 0, 1))] * len(kin.bones)
+    wp, wq = [], []
+    for i, (name, par) in enumerate(kin.bones):
+        p, q = f0[i]
+        q = _qnorm(q)
+        nm = name if name not in used else "%s.%s" % (label, name)
+        used.add(nm)
+        node = {"name": nm, "translation": list(rot(*p)), "rotation": list(rotq(q))}
+        if par >= 0:
+            node["_child"] = True
+            glb.nodes[ids[par]].setdefault("children", []).append(len(glb.nodes))
+            wq.append(_qnorm(_qmul(wq[par], q)))
+            r = _qrot(wq[par], p)
+            wp.append((wp[par][0] + r[0], wp[par][1] + r[1], wp[par][2] + r[2]))
+        else:
+            wq.append(q)
+            wp.append(tuple(p))
+        glb.nodes.append(node)
+        ids.append(len(glb.nodes) - 1)
+        rest_w.append(rot(*wp[-1]))
+    nf = len(kin.frames)
+    if nf < 2:
+        return ids, rest_w
+    times = [f[0] / float(kin.fps) for f in kin.frames]
+    t0 = times[0]
+    times = [t - t0 for t in times]
+    t_acc = glb.acc(struct.pack("<%df" % nf, *times), 5126, nf, "SCALAR", None, ([min(times)], [max(times)]))
+    samplers, channels = [], []
+    moving = 0
+    for i in range(len(kin.bones)):
+        P = [kin.frames[f][1][i][0] for f in range(nf)]
+        Q = []
+        for f in range(nf):
+            q = _qnorm(kin.frames[f][1][i][1])
+            if Q and sum(a * b for a, b in zip(q, Q[-1])) < 0:      # shortest path for LINEAR interpolation
+                q = tuple(-c for c in q)
+            Q.append(q)
+        if any(max(abs(P[f][c] - P[0][c]) for c in range(3)) > 1e-6 for f in range(nf)):
+            data = b"".join(struct.pack("<3f", *rot(*p)) for p in P)
+            samplers.append({"input": t_acc, "output": glb.acc(data, 5126, nf, "VEC3"), "interpolation": "LINEAR"})
+            channels.append({"sampler": len(samplers) - 1, "target": {"node": ids[i], "path": "translation"}})
+        if any(max(abs(Q[f][c] - Q[0][c]) for c in range(4)) > 1e-6 for f in range(nf)):
+            data = b"".join(struct.pack("<4f", *rotq(q)) for q in Q)
+            samplers.append({"input": t_acc, "output": glb.acc(data, 5126, nf, "VEC4"), "interpolation": "LINEAR"})
+            channels.append({"sampler": len(samplers) - 1, "target": {"node": ids[i], "path": "rotation"}})
+            moving += 1
+    if channels:
+        glb.anims.append({"name": label, "samplers": samplers, "channels": channels})
+    return ids, rest_w
+
+
+def _pick_bone(kin, names):
+    """bone that belongs to a mesh: name tail matches one of names (throttle <-> b.r.throttle)"""
+    want = [_norm(n) for n in names if n]
+    best = None
+    for i, (bn, par) in enumerate(kin.bones):
+        if par < 0:
+            continue
+        t = _norm(bn[4:] if bn.lower().startswith("b.r.") else bn)
+        if not t:
+            continue
+        for w in want:
+            if t == w:
+                return i
+            if len(t) >= 3 and (t in w or w in t) and best is None:
+                best = i
+    if best is not None:
+        return best
+    kids = [i for i, (_, p) in enumerate(kin.bones) if p >= 0]
+    return kids[0] if len(kids) == 1 else None
+
+
+def add_animations(pkg, asset, glb, meshes, log):
+    kins = sorted(k for k in asset.files if k.endswith(".kin"))
+    rigs = {}
+    for kf in kins:
+        base = kf[:-4]
+        try:
+            kin = read_kin(pkg.read(asset, kf))
+            ids, rest_w = add_rig(glb, kin, base, log)
+        except Exception as e:
+            log("   animation %s skipped: %s" % (kf, e))
+            continue
+        rigs[base] = (kin, ids, rest_w)
+        n_anim = len(kin.frames)
+        log("   animation %-20s %d bones, %d frames @ %d fps (%.2fs)%s" % (
+            base, len(kin.bones), n_anim, kin.fps, max(n_anim - 1, 0) / float(kin.fps),
+            "" if n_anim > 1 else "  (single pose, no motion)"))
+    for lab, im in meshes:
+        node = glb.meshnode.get(lab)
+        base = im[:-3] if im.endswith(".im") else im
+        kb = glb.kinmap.get(base)
+        if kb not in rigs:
+            kb = next((b for b in (base, lab) if b in rigs), None)
+        if node is None or kb is None:
+            continue
+        kin, ids, rest_w = rigs[kb]
+        bi = _pick_bone(kin, [base, lab, kb])
+        why = ""
+        if bi is None:
+            kids = [i for i, (_, p) in enumerate(kin.bones) if p >= 0]
+            bi = next((i for i, (_, p) in enumerate(kin.bones) if p < 0), 0)
+            mesh = glb.meshes[glb.nodes[node]["mesh"]]
+            mn_, mx_ = glb.bbox.get(lab, ([0] * 3, [0] * 3))
+            sz_ = max(mx_[k] - mn_[k] for k in range(3))
+            ctr_ = [(mx_[k] + mn_[k]) / 2 for k in range(3)]
+            at_origin = sum(c * c for c in ctr_) ** 0.5 <= sz_ * 1.5 + 0.5
+            prims = mesh["primitives"]
+            if at_origin and len(prims) == len(kids) and len(prims) > 1:
+                # one material group per bone, each modelled around its own pivot: group k belongs to bone k (by order)
+                n0 = glb.nodes[node]
+                for k_, (prim, b_) in enumerate(zip(prims, kids)):
+                    if k_ == 0:
+                        mesh["primitives"] = [prim]
+                        tgt, ti_ = n0, node
+                    else:
+                        glb.meshes.append({"name": "%s.%d" % (lab, k_), "primitives": [prim]})
+                        tgt = {"name": "%s.%s" % (lab, kin.bones[b_][0]), "mesh": len(glb.meshes) - 1}
+                        glb.nodes.append(tgt)
+                        ti_ = len(glb.nodes) - 1
+                    tgt["_child"] = True
+                    tgt.pop("translation", None)
+                    glb.nodes[ids[b_]].setdefault("children", []).append(ti_)
+                log("   bound %-22s group-per-bone: %d groups -> %d bones, by order (check the result)" % (lab, len(prims), len(kids)))
+                continue
+            why = "  (several bones, none matches the mesh name: bound to the root; skinned meshes are not supported)"
+        n = glb.nodes[node]
+        w = rest_w[bi]
+        mn, mx = glb.bbox.get(lab, ([0] * 3, [0] * 3))
+        size = max(mx[k] - mn[k] for k in range(3))
+        centre = [(mx[k] + mn[k]) / 2 for k in range(3)]
+        if sum(c * c for c in centre) ** 0.5 > size * 1.5 + 0.5:
+            loc = [-w[0], -w[1], -w[2]]          # modelled in place: undo the bone offset so it stays put at rest
+        else:                                    # pivot at its own origin: the bone supplies the position
+            cur = n.get("translation", w)        # (place_parts may already have used an attach point)
+            loc = [cur[0] - w[0], cur[1] - w[1], cur[2] - w[2]]
+        if any(abs(c) > 1e-5 for c in loc):
+            n["translation"] = loc
+        else:
+            n.pop("translation", None)
+        n["_child"] = True
+        glb.nodes[ids[bi]].setdefault("children", []).append(node)
+        log("   bound %-22s to bone %s%s" % (lab, kin.bones[bi][0], why))
+    return len(rigs)
+
+
+def parse_config(txt):
+    """tiny parser for Trainz config.txt  ->  list of (key, value-or-list)"""
+    txt = re.sub(r'(?m)("[^"\n]*")|#.*$|//.*$', lambda m: m.group(1) or "", txt)
+    toks = re.findall(r'"[^"]*"|[{}=]|[^\s{}="]+', txt)
+    pos = 0
+
+    def block():
+        nonlocal pos
+        out = []
+        while pos < len(toks):
+            t = toks[pos]
+            if t == "}":
+                pos += 1
+                return out
+            if t in "{=":
+                pos += 1
+                continue
+            key = t.strip('"')
+            pos += 1
+            if pos < len(toks) and toks[pos] == "=":
+                pos += 1
+                val = toks[pos].strip('"') if pos < len(toks) else ""
+                pos += 1
+                out.append((key, val))
+            elif pos < len(toks) and toks[pos] == "{":
+                pos += 1
+                out.append((key, block()))
+            else:
+                out.append((key, ""))
+        return out
+    return block()
+
+
+def _find_key(tree, name):
+    for k, v in tree:
+        if k.lower() == name and isinstance(v, list):
+            return v
+        if isinstance(v, list):
+            r = _find_key(v, name)
+            if r is not None:
+                return r
+    return None
+
+
+def _strings(v):
+    if isinstance(v, list):
+        for _, x in v:
+            yield from _strings(x)
+    elif isinstance(v, str):
+        yield v
+
+
+def node_config(pkg, node):
+    """convert the asset's own tag tree (where compiled configs live) into (key, value|list) pairs"""
+    out = []
+    for k in node.kids:
+        if k.name == "files":
+            continue
+        if k.type == 0:
+            out.append((k.name, node_config(pkg, k)))
+        elif k.type == 3:
+            out.append((k.name, bytes(pkg.data[k.off:k.end]).split(b"\0")[0].decode("latin1")))
+    return out
+
+
+def _norm(n):
+    n = n.lower()
+    n = n[2:] if n.startswith("a.") else n
+    return re.sub(r"[^a-z0-9]", "", n)
+
+
+def fuzzy_attach(label, attach):
+    """best attach point for a mesh whose names differ slightly (throttle_lever <-> a.throttle)"""
+    import difflib
+    ln = _norm(label)
+    scored = []
+    for name in attach:
+        an = _norm(name)
+        if not an:
+            continue
+        sc = difflib.SequenceMatcher(None, ln, an).ratio()
+        if len(an) >= 3 and an in ln or len(ln) >= 3 and ln in an:
+            sc = max(sc, 0.8)
+        scored.append((sc, name))
+    scored.sort(reverse=True)
+    if scored and scored[0][0] >= 0.6 and (len(scored) == 1 or scored[0][0] - scored[1][0] >= 0.08):
+        return scored[0][1]
+    return None
+
+
+def place_parts(pkg, asset, glb, meshes, log):
+    """Animated / accessory meshes are stored around their own pivot (the origin).  Move each one to the
+    attach point that belongs to it: via the mesh-table in the asset's config, by name, or (flagged) by
+    similar name.  Meshes that own attach points themselves are the 'main' meshes and stay put."""
+    table = {}                                # mesh basename -> [candidate attach names]
+    trees = []
+    try:
+        trees.append(node_config(pkg, asset.node))
+    except Exception:
+        pass
+    if asset.has("config.txt"):
+        try:
+            trees.append(parse_config(pkg.read(asset, "config.txt").decode("latin1")))
+        except Exception as e:
+            log("   (config.txt not read: %s)" % e)
+    for tree in trees:
+        try:
+            mt = _find_key(tree, "mesh-table") or []
+            for ename, entry in mt:
+                if not isinstance(entry, list):
+                    continue
+                mesh = next((v for k, v in entry if k.lower() == "mesh" and isinstance(v, str)), "")
+                base = mesh.replace("\\", "/").split("/")[-1].lower()
+                if base.endswith(".im"):
+                    base = base[:-3]
+                if not base:
+                    continue
+                cands = [ename, "a." + ename] + [x for x in _strings(entry) if x.lower() != mesh.lower()]
+                table.setdefault(base, []).extend(cands)
+                for x in _strings(entry):
+                    if x.lower().endswith(".kin"):
+                        glb.kinmap.setdefault(base, _base(x)[:-4])
+        except Exception as e:
+            log("   (mesh-table not read: %s)" % e)
+    glb.trees = trees
+    owners = {src for (_, src, _) in glb.attach.values()}      # meshes that define attach points
+    loose = []
+    for lab, im in meshes:
+        node = glb.meshnode.get(lab)
+        if node is None or lab in owners and lab not in table:
+            continue
+        base = im[:-3] if im.endswith(".im") else im
+        mn, mx = glb.bbox.get(lab, ([0] * 3, [0] * 3))
+        size = max(mx[k] - mn[k] for k in range(3))
+        centre = [(mx[k] + mn[k]) / 2 for k in range(3)]
+        if sum(c * c for c in centre) ** 0.5 > size * 1.5 + 0.5:
+            continue                          # already sits at its real position in the model
+        names = table.get(base.lower(), []) + [base, "a." + base, lab, "a." + lab]
+        key = next((n.lower() for n in names if n.lower() in glb.attach), None)
+        how = ""
+        if key is None:
+            free = [n for n, (_, src, _) in glb.attach.items() if src != lab]
+            key = fuzzy_attach(lab, free)
+            how = "  (matched by similar name - check it)"
+        if key is None:
+            if not (asset.has(base + ".kin") or base in glb.kinmap):   # animated parts get their position from the .kin bones
+                loose.append((lab, base))
+            continue
+        t, src, m = glb.attach[key]
+        glb.nodes[node]["translation"] = list(rot(*t))
+        q = attach_quat(m, getattr(glb, "attach_transpose", False))
+        if q:
+            glb.nodes[node]["rotation"] = list(q)
+        log("   placed %-22s at %s%s%s" % (lab, key, how, "  (+rotation)" if q else ""))
+    if loose:
+        log("   NOT placed (no attach point found, left at origin): %s" % ", ".join(l for l, _ in loose))
+        log("   attach points available: %s" % ", ".join(sorted(glb.attach)[:60]))
+        log("   asset config keys: %s" % ", ".join(sorted({k for t_ in trees for k, _ in t_})[:40]))
+        mt_names = sorted(table)
+        if mt_names:
+            log("   config mesh-table meshes: %s" % ", ".join(mt_names[:40]))
+
+
+_KUID = re.compile(r"<?kuid2?:(-?\d+):(-?\d+)(?::\d+)?>?", re.I)
+
+
+def _kuid_core(x):
+    m = _KUID.search(x or "")
+    return "kuid:%s:%s" % (m.group(1), m.group(2)) if m else None
+
+
+def _tree_text(v, depth=0):
+    if isinstance(v, list):
+        return "{" + "; ".join("%s=%s" % (k, _tree_text(x, depth + 1)) for k, x in v) + "}"
+    return repr(v)
+
+
+def add_bogeys(pkg, asset, glb, log):
+    """Trucks are separate assets referenced by the car's `bogeys` config table: place the main truck mesh at each attach point."""
+    trees = getattr(glb, "trees", [])
+    tab = None
+    for t in trees:
+        tab = _find_key(t, "bogeys")
+        if tab:
+            break
+    if not tab:
+        return 0
+    kt = {}
+    for t in trees:
+        for k, v in (_find_key(t, "kuid-table") or []):
+            if isinstance(v, str):
+                kt[k.lower()] = v
+    made = 0
+    cache = {}
+    bad = []
+    for ename, entry in tab:
+        if not isinstance(entry, list):
+            continue
+        strs = [x for x in _strings(entry)]
+        core = None
+        for x in strs:
+            core = _kuid_core(x) or _kuid_core(kt.get(x.lower()))
+            if core:
+                break
+        att = next((x.lower() for x in strs if x.lower() in glb.attach), None)
+        if att is None:
+            att = next(("a." + x.lower() for x in strs if "a." + x.lower() in glb.attach), None)
+        if att is None and ename.isdigit() and ("a.bog%s" % ename) in glb.attach:
+            att = "a.bog%s" % ename
+        if not core or att is None:
+            bad.append(ename)
+            if os.environ.get("CDP_DEBUG"):
+                log("   bogey entry %s not understood (kuid=%s attach=%s): %s" % (ename, core, att, _tree_text(entry)[:300]))
+            continue
+        if core not in cache:
+            ba = next((a for a in pkg.assets if core in a.name.lower().replace("kuid2", "kuid")), None)
+            hit = None
+            if ba is not None:
+                ms = pick_meshes(pkg, ba, False, False)
+                if ms:
+                    lab, im = ms[0]
+                    lab = "%s_%s" % ("bogey", core.split(":")[-1])
+                    add_mesh(pkg, ba, glb, im, lab, log)
+                    mi = glb.nodes[glb.meshnode[lab]]["mesh"]
+                    glb.nodes[glb.meshnode[lab]]["_child"] = True      # template node, hidden under no scene root
+                    hit = (mi, lab)
+            if hit is None:
+                log("   bogey %s is not in this package: place it by hand" % core)
+            cache[core] = hit
+        hit = cache[core]
+        if hit is None:
+            continue
+        t, _, m = glb.attach[att]
+        node = {"name": "bogey%s.%s" % (ename, att), "mesh": hit[0], "translation": list(rot(*t))}
+        q = attach_quat(m, getattr(glb, "attach_transpose", False))
+        if q:
+            node["rotation"] = list(q)
+        glb.nodes.append(node)
+        made += 1
+        log("   bogey %-3s %s placed at %s%s" % (ename, core, att, "  (+rotation)" if q else ""))
+    if bad:
+        log("   bogeys not placed automatically (config entries %s unreadable): the trucks are separate .glb files - "
+            "place them at the a.bog* empties by hand" % ", ".join(bad))
+    # template nodes (first instance) would duplicate a truck at the origin: drop their mesh
+    for core, hit in cache.items():
+        if hit:
+            glb.nodes[glb.meshnode[hit[1]]].pop("mesh", None)
+    return made
 
 
 def pick_meshes(pkg, asset, all_lods, keep_all=False):
@@ -1103,9 +1756,10 @@ def pick_meshes(pkg, asset, all_lods, keep_all=False):
         for _, b in lods:
             covered.add(b)
         # best LOD = the biggest mesh (ties: highest LOD number)
-        have = sorted([l for l in lods if l[1] in asset.files],
-                      key=lambda l: (struct.unpack_from("<I", pkg.data, asset.files[l[1]].off)[0], l[0]),
-                      reverse=True)
+        def _size(l):
+            hit = pkg.find(asset, l[1])
+            return (struct.unpack_from("<I", pkg.data, hit[0].files[hit[1]].off)[0], l[0]) if hit else None
+        have = sorted([l for l in lods if _size(l) is not None], key=_size, reverse=True)
         label = k[:-len(".lm.txt")]
         if all_lods:
             for lod, b in have:
@@ -1123,7 +1777,8 @@ def pick_meshes(pkg, asset, all_lods, keep_all=False):
 def validate_glb(path):
     """strict re-read of a written .glb; returns list of problems"""
     bad = []
-    b = open(path, "rb").read()
+    with open(path, "rb") as fh:
+        b = fh.read()
     if b[:4] != b"glTF" or struct.unpack_from("<I", b, 8)[0] != len(b):
         bad.append("bad header/length")
         return bad
@@ -1134,7 +1789,7 @@ def validate_glb(path):
     bl = struct.unpack_from("<I", b, 20 + jl)[0]
     for i, a in enumerate(doc.get("accessors", [])):
         v = doc["bufferViews"][a["bufferView"]]
-        size = {"SCALAR": 1, "VEC2": 2, "VEC3": 3}[a["type"]] * {5126: 4, 5123: 2}[a["componentType"]] * a["count"]
+        size = {"SCALAR": 1, "VEC2": 2, "VEC3": 3, "VEC4": 4}[a["type"]] * {5126: 4, 5123: 2}[a["componentType"]] * a["count"]
         if size > v["byteLength"] or v["byteOffset"] + v["byteLength"] > bl:
             bad.append("accessor %d out of range" % i)
         if v["byteLength"] == 0 or a["count"] == 0:
@@ -1146,6 +1801,14 @@ def validate_glb(path):
     for i, o in enumerate(doc.get("images", [])):
         if o.get("mimeType") not in ("image/png", "image/jpeg"):
             bad.append("image %d: bad mimeType" % i)
+    nacc, nnode = len(doc.get("accessors", [])), len(doc.get("nodes", []))
+    for ai, an in enumerate(doc.get("animations", [])):
+        for sm in an["samplers"]:
+            if sm["input"] >= nacc or sm["output"] >= nacc:
+                bad.append("animation %d: sampler accessor out of range" % ai)
+        for ch in an["channels"]:
+            if ch["target"]["node"] >= nnode or ch["sampler"] >= len(an["samplers"]):
+                bad.append("animation %d: bad channel" % ai)
     for m in doc.get("meshes", []):
         if not m["primitives"]:
             bad.append("mesh %s has no primitives" % m.get("name"))
@@ -1161,16 +1824,22 @@ def dump_tree(nodes, depth=0, maxdepth=6):
 
 def main():
     ap = argparse.ArgumentParser(description="Convert Trainz .cdp packages to .glb")
-    ap.add_argument("cdp")
+    ap.add_argument("cdp", help=".cdp package (or a loose .kin file)")
     ap.add_argument("out", nargs="?", default="cdp_out")
     ap.add_argument("--list", action="store_true", help="just list assets and files")
     ap.add_argument("--tree", action="store_true", help="print the raw tag tree (for debugging)")
+    ap.add_argument("--extract-only", help="like --extract but only files ending with this text, e.g. .kin")
     ap.add_argument("--extract", action="store_true", help="also write every file of the package to disk")
     ap.add_argument("--all-lods", action="store_true", help="export every LOD level instead of the best one")
     ap.add_argument("--keep-all", action="store_true", help="also export shadow / collision helper meshes")
+    ap.add_argument("--no-anim", action="store_true", help="do not export .kin animations")
+    ap.add_argument("--no-bogeys", action="store_true", help="do not place the trucks referenced by the car's config")
+    ap.add_argument("--attach-transpose", action="store_true", help="read attach-point rotation matrices transposed (try this if levers / trucks face the wrong way)")
+    ap.add_argument("--no-attach", action="store_true", help="do not export attach points as empty objects")
     ap.add_argument("--debug", action="store_true", help="print which normals / winding were chosen for every material group")
     ap.add_argument("--asset", help="only assets whose name / username contains this text")
     a = ap.parse_args()
+    _disable_quickedit()
     if a.debug:
         os.environ["CDP_DEBUG"] = "1"
 
@@ -1178,43 +1847,69 @@ def main():
         raise SystemExit("File not found: %s\n(put the .cdp path in quotes if it contains spaces)" % a.cdp)
     with open(a.cdp, "rb") as f:
         data = f.read()
+    if data[:4] == b"JIRF":                          # loose .kin
+        kin = read_kin(data)
+        print("cdp2glb %s" % VERSION)
+        print("%s: %d bones, %d frames @ %d fps   (source: %s)" % (
+            os.path.basename(a.cdp), len(kin.bones), len(kin.frames), kin.fps, kin.src_name))
+        for i, (n_, p_) in enumerate(kin.bones):
+            print("   bone %d %-16s parent %s" % (i, n_, kin.bones[p_][0] if p_ >= 0 else "-"))
+        if a.list:
+            return
+        os.makedirs(a.out, exist_ok=True)
+        glb = GLB()
+        base = os.path.splitext(os.path.basename(a.cdp))[0]
+        add_rig(glb, kin, base, print)
+        path = os.path.join(a.out, base + "_anim.glb")
+        glb.write(path)
+        probs = validate_glb(path)
+        print("   -> %s   [%s]" % (path, "valid" if not probs else "PROBLEMS: " + "; ".join(probs[:5])))
+        return
     pkg = Package(data)
+    print("cdp2glb %s" % VERSION)
     print("%d assets" % len(pkg.assets))
     if a.tree:
         dump_tree(parse_tree(data, 16, len(data)))
         return
     if a.list:
         for s in pkg.assets:
-            print("%-28s kind=%-14s %s  (%d files, %d meshes)" % (s.name, s.info.get("kind", "?"), s.info.get("username", ""), len(s.files), sum(k.endswith(".im") for k in s.files)))
+            print("%-28s kind=%-14s %s  (%d files, %d meshes, %d anims)" % (s.name, s.info.get("kind", "?"), s.info.get("username", ""), len(s.files), sum(k.endswith(".im") for k in s.files), sum(k.endswith(".kin") for k in s.files)))
         return
     os.makedirs(a.out, exist_ok=True)
     log = print
-    t0, made, used = time.time(), 0, set()
-    for s in pkg.assets:
+    t0, made, used = time.time(), [0], set()
+    failed = []
+
+    def export_asset(s):
         label = s.info.get("username", "") or s.name
         if a.asset and a.asset.lower() not in (s.name + " " + label).lower():
-            continue
+            return
         safe = re.sub(r"[^\w.\-]+", "_", "%s_%s" % (label, s.name))[:80] or "asset"
         while safe.lower() in used:
             safe += "_"
         used.add(safe.lower())
-        if a.extract:
+        if a.extract or a.extract_only:
             d = os.path.join(a.out, "files", safe)
             os.makedirs(d, exist_ok=True)
             for k in s.files:
+                if a.extract_only and not k.endswith(a.extract_only.lower()):
+                    return
                 try:
-                    open(os.path.join(d, os.path.basename(k)), "wb").write(pkg.read(s, k))
+                    with open(os.path.join(d, os.path.basename(k)), "wb") as fh:
+                        fh.write(pkg.read(s, k))
                 except Exception as e:
                     print("  extract failed", k, e)
         try:
             meshes = pick_meshes(pkg, s, a.all_lods, a.keep_all)
         except Exception as e:
             print("\n== %s: could not read mesh list: %s" % (label, e))
-            continue
+            return
         if not meshes:
-            continue
+            return
         print("\n== %s  [%s] kind=%s" % (label, s.name, s.info.get("kind", "?")))
         glb = GLB()
+        glb.keep_all, glb.no_attach = a.keep_all, a.no_attach
+        glb.attach_transpose = a.attach_transpose
         for lab, im in meshes:
             try:
                 tris, nm, na = add_mesh(pkg, s, glb, im, lab, log)
@@ -1222,17 +1917,39 @@ def main():
             except Exception as e:
                 print("   FAILED %s: %s" % (im, e))
         if glb.meshes:
+            try:
+                place_parts(pkg, s, glb, meshes, log)
+            except Exception as e:
+                print("   part placement failed: %s" % e)
+            if not a.no_bogeys:
+                try:
+                    add_bogeys(pkg, s, glb, log)
+                except Exception as e:
+                    print("   bogey placement failed: %s: %s" % (type(e).__name__, e))
+            if not a.no_anim:
+                try:
+                    add_animations(pkg, s, glb, meshes, log)
+                except Exception as e:
+                    print("   animation export failed: %s" % e)
             path = os.path.join(a.out, safe + ".glb")
             try:
                 glb.write(path)
                 probs = validate_glb(path)
             except Exception as e:
                 print("   FAILED writing %s: %s" % (path, e))
-                continue
-            made += 1
+                return
+            made[0] += 1
             print("   -> %s   [%s]" % (path, "valid" if not probs else "PROBLEMS: " + "; ".join(probs[:5])))
-    print("\nDone: %d .glb file(s) written to %s in %.1fs" % (made, os.path.abspath(a.out), time.time() - t0))
-    if not made:
+    for s in pkg.assets:
+        try:
+            export_asset(s)
+        except Exception as e:
+            failed.append(s.name)
+            print("\n!! asset %s failed: %s: %s" % (s.name, type(e).__name__, e))
+    print("\nDone: %d .glb file(s) written to %s in %.1fs" % (made[0], os.path.abspath(a.out), time.time() - t0))
+    if failed:
+        print("%d asset(s) failed: %s" % (len(failed), ", ".join(failed[:20])))
+    if not made[0]:
         print("Nothing was exported. Try --list to see asset names, and check the --asset text.")
 
 
