@@ -1,4 +1,4 @@
-# trainz-to-blender
+# cdp2glb
 
 Convert **Trainz `.cdp` packages** (the `ACS$` / CHUMP container) into **glTF binary (`.glb`)** files that open directly in Blender, with meshes, textures, materials and attach points.
 
@@ -38,7 +38,8 @@ On Windows, open a Command Prompt in the folder with the script (type `cmd` in F
 | `--list` | Print the assets in the package and exit. Do this first. |
 | `--asset TEXT` | Only export assets whose name or kuid contains `TEXT`. |
 | `--all-lods` | Export every LOD level instead of the best one. |
-| `--keep-all` | Also export `shadow` / `collision` helper meshes (skipped by default). |
+| `--keep-all` | Also export `shadow` / `collision` helper meshes and material groups (skipped by default). |
+| `--no-attach` | Do not export attach points as empty objects (they show as thin axis lines in Blender). |
 | `--extract` | Also dump every file in the package to `out/files/...`. |
 | `--tree` | Print the raw tag tree (debugging the container). |
 | `--debug` | Print, for every material group, which normals block was chosen and whether winding was flipped. |
@@ -59,7 +60,7 @@ Then in Blender: **File > Import > glTF 2.0 (.glb/.gltf)**.
 - **Each mesh is its own object** (`body`, `bell`, `window1l`, ...). Join them with `Ctrl+J` if you want one mesh.
 - **Attach points appear as empties** named `<mesh>.<attach name>`. Hide them with the viewport's Object Types filter if they get in the way.
 - **Cabs and interiors are separate assets**, so they come out as separate `.glb` files.
-- **Animated parts** (`anim*`, doors, shutters) are exported in their rest position as ordinary meshes. Animations themselves are not exported.
+- **Animated parts** (`anim*`, doors, shutters) are exported as ordinary meshes. Parts stored around their own pivot are moved to the matching attach point when one can be found through `config.txt`'s mesh table or by name; the log says which were placed. Animations themselves are not exported.
 - Materials use the base colour and normal map only. Trainz-specific shader features (reflections, bump settings, etc.) are not translated.
 
 ## The `.im` mesh format (what was worked out)
