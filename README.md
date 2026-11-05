@@ -1,4 +1,4 @@
-# cdp2glb
+# trainz-to-blender
 
 Convert **Trainz `.cdp` packages** (the `ACS$` / CHUMP container) into **glTF binary (`.glb`)** files that open directly in Blender, with meshes, textures, materials and attach points.
 
@@ -102,4 +102,4 @@ This tool is for converting content you own or have permission to use. Respect t
 
 ## License
 
-Add a license file of your choice (MIT is a common option for tools like this).
+MIT
